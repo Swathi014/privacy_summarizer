@@ -1,0 +1,26 @@
+# ──────────────────────────────────────────────────────────────
+# PrivSumAI – Requirements
+# Target: 8-16 GB RAM laptop (CPU or entry-level GPU)
+# ──────────────────────────────────────────────────────────────
+
+# Core ML stack
+torch>=2.1.0
+transformers>=4.40.0
+accelerate>=0.28.0
+bitsandbytes>=0.43.0          # 4-bit NF4 quantization
+peft>=0.10.0                  # QLoRA / LoRA adapters
+datasets>=2.18.0              # Hugging Face datasets
+
+# PDF parsing (choose one – both listed for fallback)
+pymupdf>=1.23.0               # Primary: fast and accurate (fitz)
+pdfplumber>=0.10.0            # Fallback
+
+# Streamlit UI
+streamlit>=1.32.0
+
+# Evaluation
+rouge-score>=0.1.2
+
+# Utilities
+sentencepiece>=0.1.99         # Tokenizer dependency for some models
+protobuf>=3.20.0

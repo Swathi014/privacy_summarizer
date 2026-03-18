@@ -1,0 +1,8 @@
+{
+  "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "num_epochs": 1,
+  "num_documents": 1,
+  "num_examples": 15
+}
