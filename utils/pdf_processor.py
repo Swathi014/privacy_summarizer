@@ -27,7 +27,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         for page in doc:
             pages_text.append(page.get_text("text"))
         doc.close()
-        return "\n".join(pages_text)
+        return clean_text("\n".join(pages_text))   # ← clean on exit
 
     except ImportError:
         pass  # try fallback
@@ -41,7 +41,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                 text = page.extract_text()
                 if text:
                     pages_text.append(text)
-        return "\n".join(pages_text)
+        return clean_text("\n".join(pages_text))   # ← clean on exit
 
     except ImportError:
         raise ImportError(
@@ -61,6 +61,9 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     # Collapse multiple spaces
     text = re.sub(r" {2,}", " ", text)
+    
+    # Fix PDF extraction artifact: "word - word" spacing around hyphen → "word-word"
+    text = re.sub(r'(\w+)\s-\s(\w+)', r'\1-\2', text)
     # Strip leading/trailing whitespace per line
     lines = [line.strip() for line in text.splitlines()]
     return "\n".join(lines).strip()

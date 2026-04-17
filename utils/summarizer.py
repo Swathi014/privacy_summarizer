@@ -1,244 +1,154 @@
 """
-summarizer.py — Hallucination-Free Edition
-────────────────────────────────────────────
-Root cause of hallucination:
-  Structured section prompts ("Document Overview:", "Problem:", etc.)
-  trigger TinyLlama's template-completion training data — it ignores
-  the actual document and fills in plausible-sounding generic text.
+summarizer.py
+─────────────
+Ollama-based Gemma 3 summarizer — configured as a strict extraction tool,
+NOT a conversational assistant.
 
-Fix:
-  1. Copy the ABSTRACT and CONCLUSION verbatim from the document
-  2. Use an extremely simple prompt: "Here is the abstract and conclusion.
-     Write a summary based on these."
-  3. No section labels in the prompt — they trigger hallucination
-  4. Feed actual document sentences, not instructions about structure
+Key design decisions:
+  • temperature=0     → fully deterministic / greedy, kills chatbot-style rambling
+  • Structured prompt → forces fixed-section output (Overview, Methodology, etc.)
+  • Hard prefix seed  → model starts mid-sentence so it cannot open with filler phrases
+  • stop sequences    → cuts off any trailing "I hope this helps!" tail
+  • char limit raised → supports longer output without truncating source material
 """
 
-from __future__ import annotations
-import os
-import re
-from typing import Generator, List, Optional
+import requests
+import json
 
-MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+OLLAMA_URL  = "http://localhost:11434/api/generate"
+MODEL_NAME  = "gemma3:4b"
+
+# ~12 000 chars ≈ ~3 000 tokens; leaves room for a long structured output
+MAX_SOURCE_CHARS = 12_000
+
+# Stop if the model slips into chatbot mode
+STOP_SEQUENCES = [
+    "I hope this", "Let me know", "Feel free",
+    "Is there anything", "Please note", "Note:",
+    "I have summarized", "I summarized",
+]
 
 
-# ─── Model Loading ────────────────────────────────────────────────────────────
+def _build_prompt(doc_text: str) -> str:
+    return (
+        "You are a document analysis tool. Your only function is to extract and "
+        "structure information from documents. You do not greet, explain, or converse. "
+        "You output structured text only.\n\n"
+        "Analyze the following document and produce a structured summary using EXACTLY "
+        "these four sections in this order. Do not add any section not listed. "
+        "Do not write any text before or after the four sections.\n\n"
+        "SECTION FORMAT:\n"
+        "**OVERVIEW**\n"
+        "A concise paragraph: domain, core problem, and proposed solution.\n\n"
+        "**METHODOLOGY**\n"
+        "A paragraph: technical approach, tools, datasets, and architecture.\n\n"
+        "**OUTCOMES**\n"
+        "A paragraph: results, deliverables, or expected contributions.\n\n"
+        "**KEYWORDS**\n"
+        "Comma-separated list of 5-8 key technical terms.\n\n"
+        "---\n"
+        f"DOCUMENT:\n{doc_text}\n"
+        "---\n\n"
+        "**OVERVIEW**\n"
+    )
 
-def load_model_and_tokenizer(
-    use_4bit: bool = True,
-    adapter_path: Optional[str] = None,
-):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
-    tokenizer.pad_token = tokenizer.eos_token
+def check_ollama_running() -> bool:
+    try:
+        r = requests.get("http://localhost:11434", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
-    if torch.cuda.is_available():
-        print(f">> GPU: {torch.cuda.get_device_name(0)}")
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
+
+def check_model_available(model: str = MODEL_NAME) -> bool:
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if r.status_code == 200:
+            models = [m["name"] for m in r.json().get("models", [])]
+            return any(model in m for m in models)
+    except Exception:
+        pass
+    return False
+
+
+def _render_summary_html(text: str) -> str:
+    import re
+    section_pattern = re.compile(r'\*\*(OVERVIEW|METHODOLOGY|OUTCOMES|KEYWORDS)\*\*')
+    parts = section_pattern.split(text)
+
+    if len(parts) <= 1:
+        return f'<div class="sum-box">{text}</div>'
+
+    html = '<div class="sum-box">'
+    i = 1
+    while i < len(parts):
+        header  = parts[i]
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        html += (
+            f'<div class="sum-section">'
+            f'<span class="sum-label">{header}</span>'
+            f'<p class="sum-content">{content}</p>'
+            f'</div>'
         )
-        model = model.to("cuda:0")
-        print(f">> Model on: {next(model.parameters()).device}")
-    else:
-        from transformers import BitsAndBytesConfig
-        cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        ) if use_4bit else None
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            quantization_config=cfg,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-        )
-
-    if adapter_path and os.path.isdir(adapter_path):
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()
-
-    model.eval()
-    return model, tokenizer
+        i += 2
+    html += "</div>"
+    return html
 
 
-# ─── Section Extractor ────────────────────────────────────────────────────────
+def generate_summary(
+    text: str,
+    max_tokens: int = 1000,
+    stream_placeholder=None,
+    model: str = MODEL_NAME,
+) -> str:
+    safe_text = text[:MAX_SOURCE_CHARS]
+    prompt    = _build_prompt(safe_text)
 
-_WANT = re.compile(
-    r'^\s*(?:\d+[\.\d]*\s+)?'
-    r'(abstract|introduction|conclusion[s]?|summary|'
-    r'contribution[s]?|result[s]?|finding[s]?|'
-    r'key\s+result[s]?|overview|background)\s*$',
-    re.IGNORECASE
-)
+    payload = {
+        "model":  model,
+        "prompt": prompt,
+        "stream": True,
+        "options": {
+            "num_predict":    max_tokens,
+            "temperature":    0,
+            "repeat_penalty": 1.15,
+            "stop":           STOP_SEQUENCES,
+        },
+    }
 
-_SKIP = re.compile(
-    r'^\s*(?:\d+[\.\d]*\s+)?'
-    r'(reference[s]?|bibliograph\w*|appendix|acknowledg\w*)\s*$',
-    re.IGNORECASE
-)
+    accumulated = "**OVERVIEW**\n"
 
-
-def _extract_best_sections(full_text: str, budget: int = 3500) -> str:
-    """
-    Directly grab Abstract + Introduction + Conclusion text verbatim.
-    These are the highest-signal sections of any research document.
-    Returns raw paragraph text — no labels, no formatting.
-    """
-    lines      = full_text.split('\n')
-    sections   = {}
-    cur_key    = 'preamble'
-    cur_lines: List[str] = []
-    skipping   = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if _SKIP.match(stripped):
-            if cur_lines:
-                sections[cur_key] = '\n'.join(cur_lines).strip()
-            skipping = True
-            cur_lines = []
-            continue
-
-        if _WANT.match(stripped) and len(stripped) < 60:
-            if cur_lines:
-                sections[cur_key] = '\n'.join(cur_lines).strip()
-            cur_key   = stripped.lower().strip()
-            cur_lines = []
-            skipping  = False
-            continue
-
-        if not skipping:
-            cur_lines.append(line)
-
-    if cur_lines and not skipping:
-        sections[cur_key] = '\n'.join(cur_lines).strip()
-
-    # Priority order for selection
-    priority = [
-        'abstract', 'introduction', 'conclusion', 'conclusions',
-        'summary', 'contributions', 'contribution',
-        'results', 'result', 'findings', 'finding',
-        'overview', 'background', 'preamble'
-    ]
-
-    selected = []
-    used     = 0
-
-    for key in priority:
-        if used >= budget:
-            break
-        for sec_key, content in sections.items():
-            if key in sec_key and content:
-                # Clean the content — remove lone numbers, short lines, URLs
-                lines_clean = [
-                    l for l in content.split('\n')
-                    if len(l.strip()) > 30
-                    and not re.match(r'^\s*[\d\.\-\*•]+\s*$', l)
-                    and 'http' not in l
-                    and 'doi.org' not in l.lower()
-                ]
-                text = ' '.join(lines_clean).strip()
-                text = re.sub(r'\s+', ' ', text)
-                if len(text) < 100:
+    try:
+        with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=180) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
                     continue
-                take = min(len(text), budget - used)
-                selected.append(text[:take])
-                used += take
-                break  # don't double-count same section
+                chunk  = json.loads(line)
+                token  = chunk.get("response", "")
+                accumulated += token
 
-    result = '\n\n'.join(selected)
+                if stream_placeholder is not None:
+                    stream_placeholder.markdown(
+                        _render_summary_html(accumulated + "▌"),
+                        unsafe_allow_html=True,
+                    )
 
-    # Fallback: just use first 3000 chars if nothing extracted
-    if len(result) < 200:
-        result = re.sub(r'\s+', ' ', full_text[:3000]).strip()
+                if chunk.get("done", False):
+                    break
 
-    return result
-
-
-# ─── Inference ────────────────────────────────────────────────────────────────
-
-def _generate(model, tokenizer, doc_text: str, max_new_tokens: int = 500) -> str:
-    import torch
-
-    device = next(model.parameters()).device
-
-    # SIMPLE prompt — no section labels that trigger template hallucination
-    prompt = (
-        "<|system|>\n"
-        "You are a document summarizer. "
-        "Read the following text carefully and write a thorough, detailed summary. "
-        "Cover: what the document is about, the problem it addresses, "
-        "the proposed solution and its key features, "
-        "the main results with specific details, and the conclusions. "
-        "Only use facts that appear in the text. Write at least 6-8 sentences.\n"
-        f"<|user|>\nText:\n{doc_text}\n\nWrite a detailed summary:\n"
-        "<|assistant|>\n"
-        "This document presents"
-    )
-
-    enc = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1400,
-        padding=False,
-    )
-    input_ids      = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
-
-    with torch.no_grad():
-        if device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                out = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=1.15,
-                    no_repeat_ngram_size=4,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,
-                )
-        else:
-            out = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                repetition_penalty=1.15,
-                no_repeat_ngram_size=4,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
+        if stream_placeholder is not None:
+            stream_placeholder.markdown(
+                _render_summary_html(accumulated),
+                unsafe_allow_html=True,
             )
 
-    new_tokens = out[0][input_ids.shape[1]:]
-    raw = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-    return "This document presents " + raw
+        return accumulated.strip()
 
-
-# ─── Public API ───────────────────────────────────────────────────────────────
-
-def summarize_chunks(
-    model,
-    tokenizer,
-    chunks: List[str],
-    max_new_tokens: int = 500,
-) -> Generator[str, None, None]:
-    """
-    Extract abstract + introduction + conclusion verbatim,
-    then use a minimal prompt that forces the model to read
-    the actual text instead of filling in hallucinated templates.
-    """
-    full_text = "\n\n".join(chunks)
-    doc_text  = _extract_best_sections(full_text, budget=3500)
-    summary   = _generate(model, tokenizer, doc_text, max_new_tokens)
-    yield summary
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Cannot reach Ollama. Make sure it is running: `ollama serve`"
+        )
+    except Exception as e:
+        raise RuntimeError(f"Ollama generation error: {e}")
