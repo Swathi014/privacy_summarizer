@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Environments
+conda/
+env/
+venv/
+.env
+
+# Model weights (optional, but recommended if you have them locally)
+*.safetensors
+*.bin

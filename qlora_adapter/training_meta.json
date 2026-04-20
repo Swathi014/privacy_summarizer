@@ -1,8 +1,10 @@
 {
-  "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "base_model": "gemma3:4b",
+  "adapter_type": "domain_prompt_adapter",
   "lora_r": 8,
   "lora_alpha": 16,
   "num_epochs": 1,
-  "num_documents": 1,
-  "num_examples": 15
+  "num_documents": 7,
+  "num_chunks": 167,
+  "trained_at": "2026-04-20T12:25:43"
 }

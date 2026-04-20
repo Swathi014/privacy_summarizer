@@ -1,43 +1,77 @@
 """
 summarizer.py
 ─────────────
-Ollama-based Gemma 3 summarizer — configured as a strict extraction tool,
-NOT a conversational assistant.
-
-Key design decisions:
-  • temperature=0     → fully deterministic / greedy, kills chatbot-style rambling
-  • Structured prompt → forces fixed-section output (Overview, Methodology, etc.)
-  • Hard prefix seed  → model starts mid-sentence so it cannot open with filler phrases
-  • stop sequences    → cuts off any trailing "I hope this helps!" tail
-  • char limit raised → supports longer output without truncating source material
+Gemma 3 document summarizer via Ollama.
+Supports optional domain adapter for improved accuracy after fine-tuning.
 """
 
 import requests
 import json
+import os
 
 OLLAMA_URL  = "http://localhost:11434/api/generate"
 MODEL_NAME  = "gemma3:4b"
+ADAPTER_DIR = "./qlora_adapter"
 
-# ~12 000 chars ≈ ~3 000 tokens; leaves room for a long structured output
-MAX_SOURCE_CHARS = 12_000
+MAX_SOURCE_CHARS = 12_000  # ~3 000 tokens; leaves room for structured output
 
-# Stop if the model slips into chatbot mode
-STOP_SEQUENCES = [
+DEFAULT_SYSTEM = (
+    "You are a document analysis tool. Your only function is to extract and "
+    "structure information from documents. You do not greet, explain, or converse. "
+    "You output structured text only."
+)
+
+STOP_SEQS = [
     "I hope this", "Let me know", "Feel free",
-    "Is there anything", "Please note", "Note:",
-    "I have summarized", "I summarized",
+    "Is there anything", "Please note", "I have summarized",
 ]
 
 
-def _build_prompt(doc_text: str) -> str:
+def check_ollama_running() -> bool:
+    try:
+        return requests.get("http://localhost:11434", timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def check_model_available(model: str = MODEL_NAME) -> bool:
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if r.status_code == 200:
+            return any(model in m["name"] for m in r.json().get("models", []))
+    except Exception:
+        pass
+    return False
+
+
+def get_adapter_system_prompt(adapter_path: str = ADAPTER_DIR) -> str:
+    """Return the domain-adapted system prompt, or fall back to default."""
+    p = os.path.join(adapter_path, "system_prompt.txt")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    return DEFAULT_SYSTEM
+
+
+def get_adapter_info(adapter_path: str = ADAPTER_DIR) -> dict:
+    """Return adapter metadata dict (config + meta merged), or {}."""
+    info = {}
+    for fname in ("adapter_config.json", "training_meta.json"):
+        p = os.path.join(adapter_path, fname)
+        if os.path.exists(p):
+            with open(p) as f:
+                info.update(json.load(f))
+    return info
+
+
+def has_adapter(adapter_path: str = ADAPTER_DIR) -> bool:
+    return os.path.exists(os.path.join(adapter_path, "system_prompt.txt"))
+
+
+def _build_user_prompt(doc_text: str) -> str:
     return (
-        "You are a document analysis tool. Your only function is to extract and "
-        "structure information from documents. You do not greet, explain, or converse. "
-        "You output structured text only.\n\n"
-        "Analyze the following document and produce a structured summary using EXACTLY "
-        "these four sections in this order. Do not add any section not listed. "
-        "Do not write any text before or after the four sections.\n\n"
-        "SECTION FORMAT:\n"
+        "Analyze the following document and produce a structured summary using "
+        "EXACTLY these four sections. Do not add any text before or after them.\n\n"
         "**OVERVIEW**\n"
         "A concise paragraph: domain, core problem, and proposed solution.\n\n"
         "**METHODOLOGY**\n"
@@ -53,33 +87,15 @@ def _build_prompt(doc_text: str) -> str:
     )
 
 
-def check_ollama_running() -> bool:
-    try:
-        r = requests.get("http://localhost:11434", timeout=3)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def check_model_available(model: str = MODEL_NAME) -> bool:
-    try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=5)
-        if r.status_code == 200:
-            models = [m["name"] for m in r.json().get("models", [])]
-            return any(model in m for m in models)
-    except Exception:
-        pass
-    return False
-
-
-def _render_summary_html(text: str) -> str:
+def _render_html(text: str) -> str:
+    """Convert **SECTION** markers to styled HTML for Streamlit rendering."""
     import re
-    section_pattern = re.compile(r'\*\*(OVERVIEW|METHODOLOGY|OUTCOMES|KEYWORDS)\*\*')
-    parts = section_pattern.split(text)
-
+    parts = re.compile(r'\*\*(OVERVIEW|METHODOLOGY|OUTCOMES|KEYWORDS)\*\*').split(text)
     if len(parts) <= 1:
-        return f'<div class="sum-box">{text}</div>'
-
+        return (
+            '<div class="sum-box"><div class="sum-section">'
+            f'<p class="sum-content">{text}</p></div></div>'
+        )
     html = '<div class="sum-box">'
     i = 1
     while i < len(parts):
@@ -92,28 +108,35 @@ def _render_summary_html(text: str) -> str:
             f'</div>'
         )
         i += 2
-    html += "</div>"
-    return html
+    return html + "</div>"
 
 
 def generate_summary(
     text: str,
-    max_tokens: int = 1000,
+    max_tokens: int = 900,
     stream_placeholder=None,
-    model: str = MODEL_NAME,
+    use_adapter: bool = True,
+    adapter_path: str = ADAPTER_DIR,
 ) -> str:
-    safe_text = text[:MAX_SOURCE_CHARS]
-    prompt    = _build_prompt(safe_text)
+    """
+    Generate a structured 4-section summary using Gemma 3.
+
+    If use_adapter=True and an adapter exists, the domain-adapted system
+    prompt is used instead of the generic default.
+    """
+    safe_text  = text[:MAX_SOURCE_CHARS]
+    sys_prompt = get_adapter_system_prompt(adapter_path) if use_adapter else DEFAULT_SYSTEM
 
     payload = {
-        "model":  model,
-        "prompt": prompt,
+        "model":  MODEL_NAME,
+        "prompt": _build_user_prompt(safe_text),
+        "system": sys_prompt,
         "stream": True,
         "options": {
             "num_predict":    max_tokens,
             "temperature":    0,
             "repeat_penalty": 1.15,
-            "stop":           STOP_SEQUENCES,
+            "stop":           STOP_SEQS,
         },
     }
 
@@ -125,30 +148,23 @@ def generate_summary(
             for line in resp.iter_lines():
                 if not line:
                     continue
-                chunk  = json.loads(line)
-                token  = chunk.get("response", "")
-                accumulated += token
+                chunk = json.loads(line)
+                accumulated += chunk.get("response", "")
 
-                if stream_placeholder is not None:
+                if stream_placeholder:
                     stream_placeholder.markdown(
-                        _render_summary_html(accumulated + "▌"),
+                        _render_html(accumulated + "▌"),
                         unsafe_allow_html=True,
                     )
-
-                if chunk.get("done", False):
+                if chunk.get("done"):
                     break
 
-        if stream_placeholder is not None:
-            stream_placeholder.markdown(
-                _render_summary_html(accumulated),
-                unsafe_allow_html=True,
-            )
+        if stream_placeholder:
+            stream_placeholder.markdown(_render_html(accumulated), unsafe_allow_html=True)
 
         return accumulated.strip()
 
     except requests.exceptions.ConnectionError:
-        raise ConnectionError(
-            "Cannot reach Ollama. Make sure it is running: `ollama serve`"
-        )
+        raise ConnectionError("Cannot reach Ollama. Run:  ollama serve")
     except Exception as e:
         raise RuntimeError(f"Ollama generation error: {e}")
